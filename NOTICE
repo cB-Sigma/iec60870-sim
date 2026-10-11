@@ -1,0 +1,49 @@
+iec60870-sim (simulated IEC 60870-5-104 and -101 controlled stations, in Go)
+Copyright 2026 Abhinav Gautam
+
+This module is licensed under the Apache License, Version 2.0 (LICENSE).
+
+The code was written for SigmaM2M, a oneM2M platform, from the IEC
+standards listed in PROVENANCE.md. It contains no code from other
+projects. The source files that come from SigmaM2M carry no per-file
+copyright header (the convention of the code they come from); the
+copyright line above covers them. Files added for this module carry
+"Copyright 2026 Abhinav Gautam" and "SPDX-License-Identifier: Apache-2.0".
+
+Specifications
+--------------
+
+The IEC 60870-5 and IEC 62351 publications the simulators follow are
+licensed IEC publications; none is redistributed and no text of them is
+reproduced. This project is not affiliated with or endorsed by the IEC.
+
+Dependencies
+------------
+
+- github.com/cB-Sigma/iec60870 (Apache-2.0, Copyright 2026 Abhinav
+  Gautam): the codec, links and A-Profile the simulators are built on;
+  through it github.com/cB-Sigma/iotcrypto, cloudflare/circl
+  (BSD-3-Clause), decred's secp256k1 (ISC), goburrow/serial (MIT) and
+  golang.org/x/crypto and x/sys (BSD-3-Clause), as listed in its NOTICE.
+- github.com/cB-Sigma/iotsec (Apache-2.0, Copyright 2026 Abhinav
+  Gautam): the security seams.
+- The Go standard library (BSD-3-Clause, Copyright The Go Authors).
+
+Interop test peer (interop/, not part of the module's packages)
+---------------------------------------------------------------
+
+The nested test-only module interop/ builds lib60870-C v2.4.1
+(https://github.com/mz-automation/lib60870, Copyright MZ Automation GmbH,
+GPLv3 or a commercial licence) with mbedtls 3.6.6 (Apache-2.0 or
+GPL-2.0-or-later) and socat in a Docker container from their sources,
+together with a peer program of ours (interop/peer/peer.c, Apache-2.0)
+and lib60870's own example programs. lib60870 is used only as a test
+peer: no lib60870 or mbedtls source is included in this repository,
+nothing of it is linked into this module, and the container image is
+built on the tester's machine and not distributed.
+
+Test data
+---------
+
+Every key, certificate, address and point value in this module is a
+made-up demo value; none belongs to a real installation.
