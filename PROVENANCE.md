@@ -16,7 +16,9 @@ tests (interop/) were added. For v0.2.0 (also 2026-10-11) the interop
 tests were extended and the peer program grew; besides lib60870's
 headers and examples, some of its source files were read to write the
 peer (see iec60870's PROVENANCE.md). The one simulator fix of v0.2.0 came
-from a failing interop run.
+from a failing interop run. For v0.3.0 the controlled-station logic of
+`iec104sim` and `iec101sim` was lifted into iec60870's `station` package,
+and both simulators now run on it, keeping their switches and recording.
 
 ## Sources
 

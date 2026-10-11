@@ -1,5 +1,5 @@
-github.com/cB-Sigma/iec60870 v0.2.0 h1:I6CJlqHKSJ7dMKh5ch0s6MC0zujKA9G/TyQdmyCHq4g=
-github.com/cB-Sigma/iec60870 v0.2.0/go.mod h1:NHUbkkWU9BnkEdlvJaws/jDWByWCwTkfcUmcCoSqSC0=
+github.com/cB-Sigma/iec60870 v0.3.0 h1:F+7QLjLwCrRmg9QEBUVqMzs8jILl8EteG1v7ZxlIhYM=
+github.com/cB-Sigma/iec60870 v0.3.0/go.mod h1:NHUbkkWU9BnkEdlvJaws/jDWByWCwTkfcUmcCoSqSC0=
 github.com/cB-Sigma/iotcrypto v0.1.0 h1:dpW2jpBcwkug0bTz2qOvH7lp+rp+6eJxmugChP7f5tQ=
 github.com/cB-Sigma/iotcrypto v0.1.0/go.mod h1:SlKPoP00OgqfMJpaa+fNq0aqcoFhGU3NpyKCJ7UtR4g=
 github.com/cB-Sigma/iotsec v0.1.0 h1:mAFVyYLDXR7o9aVSJf6h4P9vGkWdYTPV320+FLUPGJ8=

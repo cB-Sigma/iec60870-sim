@@ -24,6 +24,7 @@ import (
 	"github.com/cB-Sigma/iec60870-sim/sim/iec104sim"
 	"github.com/cB-Sigma/iec60870/cs101"
 	"github.com/cB-Sigma/iec60870/sec"
+	"github.com/cB-Sigma/iec60870/station"
 )
 
 // Point is one monitored object.
@@ -72,11 +73,17 @@ type Station struct {
 	Security *sec.SecureLink
 	secCh    chan []sec.Frame
 
-	points   map[uint32]*Point
+	// st is the library's controlled station (point database,
+	// interrogation, clock synchronisation, commands); se its session on
+	// this line, fed in order by a worker.
+	st   *station.Station
+	se   *station.Session
+	work chan *iec60870.ASDU
+	line *Line
+
 	class1   [][]byte
 	class2   [][]byte
 	commands []Command
-	selected map[uint32]bool
 	clock    []time.Time
 	gi, ci   int
 	resets   int
@@ -88,8 +95,84 @@ type Station struct {
 // NewStation creates a station with IEC 101's usual sizes (cause 1, CA 1,
 // IOA 2).
 func NewStation(link, ca uint16) *Station {
-	return &Station{LinkAddress: link, CA: ca, Params: iec60870.Params{COTSize: 1, CASize: 1, IOASize: 2}, Loc: time.UTC,
-		Controls: map[uint32]uint32{}, points: map[uint32]*Point{}, lastFCB: -1, Proc: iec104sim.NewProcedures()}
+	s := &Station{LinkAddress: link, CA: ca, Params: iec60870.Params{COTSize: 1, CASize: 1, IOASize: 2}, Loc: time.UTC,
+		Controls: map[uint32]uint32{}, lastFCB: -1, Proc: iec104sim.NewProcedures()}
+	s.st = station.New(station.Config{CA: ca, Params: s.Params, ControlFor: s.control})
+	return s
+}
+
+// Library returns the library station the simulated station runs on.
+func (s *Station) Library() *station.Station { return s.st }
+
+// control turns Controls and the command switches into the library's
+// control of a command address (switches read under the line's lock).
+func (s *Station) control(_ uint16, ioa uint32) (station.Control, bool) {
+	l := s.line
+	l.mu.Lock()
+	target, ok := s.Controls[ioa]
+	noTerm := s.NoActTerm
+	l.mu.Unlock()
+	if !ok {
+		return station.Control{}, false
+	}
+	return station.Control{IOA: ioa, NoTermination: noTerm,
+		Select: func(context.Context, station.Command) error {
+			l.mu.Lock()
+			refuse := s.RefuseSelect
+			l.mu.Unlock()
+			if refuse {
+				return errors.New("select refused")
+			}
+			return nil
+		},
+		Execute: func(_ context.Context, c station.Command, confirm func()) error {
+			l.mu.Lock()
+			refuse := s.RefuseExecute
+			l.mu.Unlock()
+			if refuse {
+				return errors.New("execute refused")
+			}
+			confirm()
+			l.mu.Lock()
+			sec := s.st.SectorAt(s.CA)
+			l.mu.Unlock()
+			if p, ok := sec.Get(target); ok {
+				o := p.Object
+				o.Value, o.Time = c.Value, time.Time{}
+				_ = sec.ReturnInfo(o, false)
+			}
+			return nil
+		}}, true
+}
+
+// attach starts the station's library session on line l (under l.mu).
+func (s *Station) attach(l *Line, done <-chan struct{}) {
+	if s.se != nil {
+		return
+	}
+	s.se = s.st.Attach(station.SessionConfig{Params: s.Params, Loc: s.Loc, MaxASDU: cs101.MaxASDU(l.ASize),
+		Send: func(_ context.Context, b []byte) error {
+			l.mu.Lock()
+			s.enqueue(b)
+			l.mu.Unlock()
+			if l.Balanced {
+				go l.flush(s)
+			}
+			return nil
+		}})
+	work, se := make(chan *iec60870.ASDU, 256), s.se
+	s.work = work
+	go func() {
+		for {
+			select {
+			case <-done:
+				se.Close()
+				return
+			case a := <-work:
+				se.HandleASDU(a)
+			}
+		}
+	}()
 }
 
 // Line is a simulated serial line with one or more stations.
@@ -112,6 +195,8 @@ type Line struct {
 	// A-Profile timers and message queues of the stations.
 	secDone chan struct{}
 	secStop func()
+	// workDone ends the stations' library sessions.
+	workDone chan struct{}
 }
 
 // NewLine creates a line.
@@ -119,6 +204,7 @@ func NewLine(balanced bool, stations ...*Station) *Line {
 	l := &Line{Balanced: balanced, ASize: 1, stations: map[uint16]*Station{}, resp: make(chan cs101.Frame, 4)}
 	for _, s := range stations {
 		l.stations[s.LinkAddress] = s
+		s.line = l
 	}
 	return l
 }
@@ -135,6 +221,12 @@ func (l *Line) ListenAddr(addr string) error {
 	}
 	l.mu.Lock()
 	l.ln, l.addr = ln, ln.Addr().String()
+	if l.workDone == nil {
+		l.workDone = make(chan struct{})
+		for _, s := range l.stations {
+			s.attach(l, l.workDone)
+		}
+	}
 	if l.secDone == nil {
 		l.secDone = make(chan struct{})
 		ctx, cancel := context.WithCancel(context.Background())
@@ -179,6 +271,13 @@ func (l *Line) Stop() {
 		close(l.secDone)
 		l.secStop, l.secDone = nil, nil
 	}
+	if l.workDone != nil {
+		close(l.workDone)
+		l.workDone = nil
+		for _, s := range l.stations {
+			s.se = nil
+		}
+	}
 	if l.ln != nil {
 		_ = l.ln.Close()
 	}
@@ -203,7 +302,17 @@ func (l *Line) Lock() { l.mu.Lock() }
 func (l *Line) Unlock() { l.mu.Unlock() }
 
 // Set stores a point.
-func (s *Station) Set(ioa uint32, p Point) { cp := p; s.points[ioa] = &cp }
+func (s *Station) Set(ioa uint32, p Point) {
+	s.st.SectorAt(s.CA).Add(station.Point{Type: p.Type, Object: iec60870.Object{IOA: ioa, Value: p.Value, Quality: p.Quality}})
+}
+
+// Get returns a point.
+func (s *Station) Get(ioa uint32) Point {
+	if p, ok := s.st.SectorAt(s.CA).Get(ioa); ok {
+		return Point{Type: p.Type, Value: p.Value, Quality: p.Quality}
+	}
+	return Point{}
+}
 
 // Frames returns every frame received.
 func (l *Line) Frames() []cs101.Frame {
@@ -481,21 +590,14 @@ func (l *Line) userData(s *Station, b []byte) {
 			s.enqueue(enc)
 		}
 	}
-	con := func(neg bool) {
-		r := *a
-		r.Cause, r.Negative = iec60870.CauseActCon, neg
-		reply(&r)
-	}
+	sec := s.st.SectorAt(s.CA)
 	var ioas []uint32
-	for ioa := range s.points {
-		ioas = append(ioas, ioa)
+	for _, p := range sec.Points() {
+		ioas = append(ioas, p.IOA)
 	}
 	get := func(ioa uint32) (iec60870.TypeID, float64, uint8, bool) {
-		p, ok := s.points[ioa]
-		if !ok {
-			return 0, 0, 0, false
-		}
-		return p.Type, p.Value, p.Quality, true
+		p, ok := sec.Get(ioa)
+		return p.Type, p.Value, p.Quality, ok
 	}
 	if s.Proc.Handle(a, ioas, get, reply) {
 		return
@@ -504,58 +606,20 @@ func (l *Line) userData(s *Station, b []byte) {
 	switch a.Type {
 	case iec60870.CIcNa1:
 		s.gi++
-		con(false)
-		for ioa, p := range s.points {
-			reply(&iec60870.ASDU{Type: p.Type, Cause: iec60870.CauseInterrogated, Objects: []iec60870.Object{{IOA: ioa, Value: p.Value, Quality: p.Quality}}})
-		}
-		r := *a
-		r.Cause = iec60870.CauseActTerm
-		reply(&r)
 	case iec60870.CCiNa1:
 		s.ci++
-		con(false)
 	case iec60870.CCsNa1:
 		s.clock = append(s.clock, o.Time)
-		con(false)
 	default:
-		s.commands = append(s.commands, Command{Type: a.Type, IOA: o.IOA, Value: o.Value, Select: o.Select, Cause: a.Cause})
-		if s.selected == nil {
-			s.selected = map[uint32]bool{}
+		if a.Type.Control() && a.Type < iec60870.MEiNa1 {
+			s.commands = append(s.commands, Command{Type: a.Type, IOA: o.IOA, Value: o.Value, Select: o.Select, Cause: a.Cause})
 		}
-		if a.Cause == iec60870.CauseDeactivation {
-			// Cancelling a select: confirmed when one is pending.
-			r := *a
-			r.Cause, r.Negative = iec60870.CauseDeactCon, !(o.Select && s.selected[o.IOA])
-			delete(s.selected, o.IOA)
-			reply(&r)
-			return
-		}
-		mon, ok := s.Controls[o.IOA]
-		if !ok {
-			r := *a
-			r.Cause, r.Negative = iec60870.CauseUnknownObject, true
-			reply(&r)
-			return
-		}
-		if o.Select && s.RefuseSelect || !o.Select && s.RefuseExecute {
-			con(true)
-			return
-		}
-		con(false)
-		if o.Select {
-			s.selected[o.IOA] = true
-		} else {
-			delete(s.selected, o.IOA)
-			if p := s.points[mon]; p != nil {
-				p.Value = o.Value
-				reply(&iec60870.ASDU{Type: p.Type, Cause: iec60870.CauseReturnRemote, Objects: []iec60870.Object{{IOA: mon, Value: p.Value}}})
-			}
-			if !s.NoActTerm {
-				r := *a
-				r.Cause = iec60870.CauseActTerm
-				reply(&r)
-			}
-		}
+	}
+	// The rest is the library station's, in order, outside the line's
+	// lock; any common address is taken as the station's own.
+	a.CA = s.CA
+	if s.work != nil {
+		s.work <- a
 	}
 }
 

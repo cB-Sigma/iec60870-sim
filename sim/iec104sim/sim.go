@@ -19,7 +19,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +26,7 @@ import (
 	"github.com/cB-Sigma/iec60870"
 	"github.com/cB-Sigma/iec60870/cs104"
 	"github.com/cB-Sigma/iec60870/sec"
+	"github.com/cB-Sigma/iec60870/station"
 
 	"github.com/cB-Sigma/iotsec"
 )
@@ -91,15 +91,17 @@ type Station struct {
 	TamperNext bool
 	lastSecure [][]byte
 
-	mu       sync.Mutex
-	ln       net.Listener
-	addr     string
-	tlsCfg   *tls.Config
-	points   map[uint32]*Point
+	mu     sync.Mutex
+	ln     net.Listener
+	addr   string
+	tlsCfg *tls.Config
+	// st is the library's controlled station: the point database,
+	// interrogation, clock synchronisation and commands; the switches
+	// above reach it through its hooks.
+	st       *station.Station
 	conns    map[*conn]bool
 	commands []Command
 	requests []Command // every ASDU received: type, cause, first IOA
-	selected map[uint32]bool
 	clock    []time.Time
 	gi, ci   int
 	sRecv    int // S-frames received
@@ -113,9 +115,67 @@ type Station struct {
 
 // New creates a station with common address ca (default parameters).
 func New(ca uint16) *Station {
-	return &Station{CA: ca, Params: iec60870.Params{}.WithDefaults(), Loc: time.UTC,
-		points: map[uint32]*Point{}, conns: map[*conn]bool{}, selected: map[uint32]bool{}, Controls: map[uint32]uint32{},
-		Proc: NewProcedures()}
+	s := &Station{CA: ca, Params: iec60870.Params{}.WithDefaults(), Loc: time.UTC,
+		conns: map[*conn]bool{}, Controls: map[uint32]uint32{}, Proc: NewProcedures()}
+	s.st = station.New(station.Config{CA: ca, ControlFor: s.control, Intercept: s.intercept})
+	return s
+}
+
+// sector is the library sector at the station's (current) common address.
+func (s *Station) sector() *station.Sector {
+	s.mu.Lock()
+	ca := s.CA
+	s.mu.Unlock()
+	return s.st.SectorAt(ca)
+}
+
+// control turns Controls and the command switches into the library's
+// control of a command address.
+func (s *Station) control(_ uint16, ioa uint32) (station.Control, bool) {
+	s.mu.Lock()
+	target, ok := s.Controls[ioa]
+	reqSel, noTerm, neg := s.RequireSelect, s.NoActTerm, s.NegActTerm
+	s.mu.Unlock()
+	if !ok {
+		return station.Control{}, false
+	}
+	wait := func() {
+		s.mu.Lock()
+		d := s.ConfirmDelay
+		s.mu.Unlock()
+		time.Sleep(d)
+	}
+	return station.Control{IOA: ioa, SelectRequired: reqSel, NoTermination: noTerm,
+		Select: func(context.Context, station.Command) error {
+			wait()
+			s.mu.Lock()
+			refuse := s.RefuseSelect
+			s.mu.Unlock()
+			if refuse {
+				return errors.New("select refused")
+			}
+			return nil
+		},
+		Execute: func(_ context.Context, c station.Command, confirm func()) error {
+			wait()
+			s.mu.Lock()
+			refuse := s.RefuseExecute
+			s.mu.Unlock()
+			if refuse {
+				return errors.New("execute refused")
+			}
+			confirm()
+			sec := s.sector()
+			if p, ok := sec.Get(target); ok {
+				o := p.Object
+				o.Value, o.Time = c.Value, time.Time{}
+				_ = sec.ReturnInfo(o, false)
+			}
+			if neg {
+				return errors.New("the operation failed")
+			}
+			return nil
+		}}, true
 }
 
 // Listen starts accepting on 127.0.0.1 (a free port unless addr is set),
@@ -188,21 +248,20 @@ func (s *Station) Unlock() { s.mu.Unlock() }
 
 // Set stores a point.
 func (s *Station) Set(ioa uint32, p Point) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cp := p
-	s.points[ioa] = &cp
+	s.sector().Add(station.Point{Type: p.Type, Object: iec60870.Object{IOA: ioa, Value: p.Value, Quality: p.Quality}})
 }
 
 // Get returns a point.
 func (s *Station) Get(ioa uint32) Point {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p := s.points[ioa]; p != nil {
-		return *p
+	if p, ok := s.sector().Get(ioa); ok {
+		return Point{Type: p.Type, Value: p.Value, Quality: p.Quality}
 	}
 	return Point{}
 }
+
+// Library returns the library station the simulator runs on: its sectors,
+// sessions and statistics.
+func (s *Station) Library() *station.Station { return s.st }
 
 // Commands returns the commands received so far.
 func (s *Station) Commands() []Command {
@@ -331,6 +390,7 @@ const (
 
 type conn struct {
 	s      *Station
+	se     *station.Session
 	c      net.Conn
 	secCh  chan []sec.Frame
 	sec    *sec.SecureLink // the station's A-Profile when the connection was accepted
@@ -338,8 +398,6 @@ type conn struct {
 	vs, vr uint16
 	ack    uint16 // oldest own I-frame not yet acknowledged
 	state  atomic.Int32
-	// negTerm is the station's NegActTerm when the command came.
-	negTerm bool
 }
 
 func (s *Station) accept(ln net.Listener) {
@@ -355,6 +413,8 @@ func (s *Station) accept(ln net.Listener) {
 			return
 		}
 		cn := &conn{s: s, c: c, sec: s.Security}
+		cn.se = s.st.Attach(station.SessionConfig{Params: s.Params, Loc: s.Loc, MaxASDU: cs104.MaxASDU,
+			Send: func(_ context.Context, b []byte) error { return cn.sendI(b) }})
 		// Under the IEC 62351-3 profile a timed key update on an idle
 		// connection is preceded by a TESTFR act, as cs104.Link does.
 		iotsec.SetKeepalive(c, func() error {
@@ -443,6 +503,7 @@ func (c *conn) serve() {
 	}
 	defer func() {
 		close(done)
+		c.se.Close()
 		if c.sec != nil {
 			c.sec.Detach(c)
 		}
@@ -545,21 +606,11 @@ func (c *conn) serve() {
 				a.ASDU = data
 			}
 			if as, err := iec60870.DecodeASDU(a.ASDU, s.Params, s.Loc); err == nil {
-				c.handle(as)
+				c.se.HandleASDU(as)
 			} else {
-				c.reply(&iec60870.ASDU{Type: iec60870.TypeID(a.ASDU[0]), Cause: iec60870.CauseUnknownType, Negative: true,
-					Objects: []iec60870.Object{{}}})
+				c.se.Handle(a.ASDU)
 			}
 		}
-	}
-}
-
-func (c *conn) reply(a *iec60870.ASDU) {
-	if a.CA == 0 {
-		a.CA = c.s.CA
-	}
-	if b, err := a.Encode(c.s.Params, c.s.Loc); err == nil {
-		_ = c.sendI(b)
 	}
 }
 
@@ -570,193 +621,68 @@ func mirror(a *iec60870.ASDU, cause iec60870.Cause, negative bool) *iec60870.ASD
 	return &m
 }
 
-func (c *conn) handle(a *iec60870.ASDU) {
-	s := c.s
-	s.mu.Lock()
-	s.requests = append(s.requests, Command{Type: a.Type, IOA: a.Objects[0].IOA, Cause: a.Cause})
-	s.mu.Unlock()
-	if a.CA != s.CA && a.CA != 0xffff {
-		c.reply(mirror(a, iec60870.CauseUnknownCA, true))
-		return
+// intercept sees every request before the library station: it records
+// it, refuses other common addresses, runs Procedures, and applies the
+// switches the library has no hook for (silent and late commands, a test
+// command answered with another counter). The rest the library answers.
+func (s *Station) intercept(a *iec60870.ASDU, reply func(*iec60870.ASDU)) bool {
+	var first iec60870.Object
+	if len(a.Objects) > 0 {
+		first = a.Objects[0]
 	}
 	s.mu.Lock()
+	s.requests = append(s.requests, Command{Type: a.Type, IOA: first.IOA, Cause: a.Cause})
+	ca := s.CA
+	s.mu.Unlock()
+	if a.CA != ca && a.CA != 0xffff {
+		reply(mirror(a, iec60870.CauseUnknownCA, true))
+		return true
+	}
+	// The broadcast address is answered as the station's own.
+	a.CA = ca
+	sec := s.st.SectorAt(ca)
 	var ioas []uint32
-	for ioa := range s.points {
-		ioas = append(ioas, ioa)
+	for _, p := range sec.Points() {
+		ioas = append(ioas, p.IOA)
 	}
-	s.mu.Unlock()
 	get := func(ioa uint32) (iec60870.TypeID, float64, uint8, bool) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		p, ok := s.points[ioa]
-		if !ok {
-			return 0, 0, 0, false
-		}
-		return p.Type, p.Value, p.Quality, true
+		p, ok := sec.Get(ioa)
+		return p.Type, p.Value, p.Quality, ok
 	}
-	if s.Proc.Handle(a, ioas, get, c.reply) {
-		return
+	if s.Proc.Handle(a, ioas, get, reply) {
+		return true
 	}
 	switch a.Type {
 	case iec60870.CIcNa1:
 		s.mu.Lock()
 		s.gi++
 		s.mu.Unlock()
-		c.reply(mirror(a, iec60870.CauseActCon, false))
-		c.interrogate(iec60870.CauseInterrogated, func(t iec60870.TypeID) bool { return t != iec60870.MItNa1 })
-		c.reply(mirror(a, iec60870.CauseActTerm, false))
 	case iec60870.CCiNa1:
 		s.mu.Lock()
 		s.ci++
 		s.mu.Unlock()
-		c.reply(mirror(a, iec60870.CauseActCon, false))
-		c.interrogate(iec60870.CauseCounterGen, func(t iec60870.TypeID) bool { return t == iec60870.MItNa1 })
-		c.reply(mirror(a, iec60870.CauseActTerm, false))
 	case iec60870.CCsNa1:
 		s.mu.Lock()
-		s.clock = append(s.clock, a.Objects[0].Time)
+		s.clock = append(s.clock, first.Time)
 		s.mu.Unlock()
-		c.reply(mirror(a, iec60870.CauseActCon, false))
 	case iec60870.CTsTa1:
-		// Clause 8.8: the confirmation repeats the counter and the time;
-		// the address is 0 (Amendment 1).
-		if a.Objects[0].IOA != 0 {
-			c.reply(mirror(a, iec60870.CauseUnknownObject, true))
-			return
-		}
-		m := mirror(a, iec60870.CauseActCon, false)
 		s.mu.Lock()
-		if s.TestMismatch {
-			m.Objects[0].Value++
-		}
+		mismatch := s.TestMismatch
 		s.mu.Unlock()
-		c.reply(m)
+		if mismatch && first.IOA == 0 {
+			m := mirror(a, iec60870.CauseActCon, false)
+			m.Objects[0].Value++
+			reply(m)
+			return true
+		}
 	case iec60870.CScNa1, iec60870.CDcNa1, iec60870.CRcNa1, iec60870.CSeNa1, iec60870.CSeNb1, iec60870.CSeNc1, iec60870.CBoNa1,
 		iec60870.CScTa1, iec60870.CDcTa1, iec60870.CRcTa1, iec60870.CSeTa1, iec60870.CSeTb1, iec60870.CSeTc1, iec60870.CBoTa1:
-		c.command(a)
-	default:
-		c.reply(mirror(a, iec60870.CauseUnknownType, true))
-	}
-}
-
-func (c *conn) interrogate(cause iec60870.Cause, want func(iec60870.TypeID) bool) {
-	s := c.s
-	s.mu.Lock()
-	var ioas []uint32
-	for ioa, p := range s.points {
-		if want(p.Type) {
-			ioas = append(ioas, ioa)
-		}
-	}
-	sort.Slice(ioas, func(i, j int) bool { return ioas[i] < ioas[j] })
-	byType := map[iec60870.TypeID][]iec60870.Object{}
-	var order []iec60870.TypeID
-	for _, ioa := range ioas {
-		p := s.points[ioa]
-		if _, ok := byType[p.Type]; !ok {
-			order = append(order, p.Type)
-		}
-		byType[p.Type] = append(byType[p.Type], iec60870.Object{IOA: ioa, Value: p.Value, Quality: p.Quality})
-	}
-	s.mu.Unlock()
-	for _, t := range order {
-		objs := byType[t]
-		for len(objs) > 0 {
-			n := min(len(objs), 20)
-			c.reply(&iec60870.ASDU{Type: t, Cause: cause, Objects: objs[:n]})
-			objs = objs[n:]
-		}
-	}
-}
-
-func (c *conn) command(a *iec60870.ASDU) {
-	s := c.s
-	o := a.Objects[0]
-	s.mu.Lock()
-	late := a.Type.TimeTagged() && s.MaxDelay > 0 && time.Since(o.Time) > s.MaxDelay
-	s.commands = append(s.commands, Command{Type: a.Type, IOA: o.IOA, Value: o.Value, Select: o.Select, Cause: a.Cause, Late: late})
-	if late {
-		s.mu.Unlock()
-		return
-	}
-	silent, refSel, refExe, reqSel, noTerm := s.SilentCommands, s.RefuseSelect, s.RefuseExecute, s.RequireSelect, s.NoActTerm
-	c.negTerm = s.NegActTerm
-	delay := s.ConfirmDelay
-	s.mu.Unlock()
-	if silent {
-		return
-	}
-	if delay > 0 {
-		go func() { // the same delay for every command keeps their order
-			time.Sleep(delay)
-			c.answerCommand(a, refSel, refExe, reqSel, noTerm)
-		}()
-		return
-	}
-	c.answerCommand(a, refSel, refExe, reqSel, noTerm)
-}
-
-// answerCommand confirms, refuses or terminates command a.
-func (c *conn) answerCommand(a *iec60870.ASDU, refSel, refExe, reqSel, noTerm bool) {
-	s := c.s
-	o := a.Objects[0]
-	s.mu.Lock()
-	target, known := s.Controls[o.IOA]
-	wasSelected := s.selected[o.IOA]
-	s.mu.Unlock()
-	if a.Cause == iec60870.CauseDeactivation {
-		// Cancelling a select: confirmed when one is pending.
 		s.mu.Lock()
-		ok := o.Select && s.selected[o.IOA]
-		delete(s.selected, o.IOA)
+		late := a.Type.TimeTagged() && s.MaxDelay > 0 && time.Since(first.Time) > s.MaxDelay
+		s.commands = append(s.commands, Command{Type: a.Type, IOA: first.IOA, Value: first.Value, Select: first.Select, Cause: a.Cause, Late: late})
+		silent := s.SilentCommands
 		s.mu.Unlock()
-		c.reply(mirror(a, iec60870.CauseDeactCon, !ok))
-		return
+		return late || silent
 	}
-	if a.Cause != iec60870.CauseActivation {
-		c.reply(mirror(a, iec60870.CauseUnknownCause, true))
-		return
-	}
-	if !known {
-		c.reply(mirror(a, iec60870.CauseUnknownObject, true))
-		return
-	}
-	if o.Select {
-		if refSel {
-			c.reply(mirror(a, iec60870.CauseActCon, true))
-			return
-		}
-		s.mu.Lock()
-		s.selected[o.IOA] = true
-		s.mu.Unlock()
-		c.reply(mirror(a, iec60870.CauseActCon, false))
-		return
-	}
-	if refExe || (reqSel && !wasSelected) {
-		c.reply(mirror(a, iec60870.CauseActCon, true))
-		return
-	}
-	s.mu.Lock()
-	delete(s.selected, o.IOA)
-	p := s.points[target]
-	var fb *iec60870.ASDU
-	if p != nil {
-		p.Value = o.Value
-		// Return information (cause 11) is for single, double and step
-		// positions (clause 7.7); other values change spontaneously.
-		cause := iec60870.CauseSpontaneous
-		switch p.Type {
-		case iec60870.MSpNa1, iec60870.MDpNa1, iec60870.MStNa1, iec60870.MSpTb1, iec60870.MDpTb1, iec60870.MStTb1:
-			cause = iec60870.CauseReturnRemote
-		}
-		fb = &iec60870.ASDU{Type: p.Type, Cause: cause, Objects: []iec60870.Object{{IOA: target, Value: p.Value, Quality: p.Quality}}}
-	}
-	s.mu.Unlock()
-	c.reply(mirror(a, iec60870.CauseActCon, false))
-	if fb != nil {
-		c.reply(fb)
-	}
-	if !noTerm {
-		c.reply(mirror(a, iec60870.CauseActTerm, c.negTerm))
-	}
+	return false
 }

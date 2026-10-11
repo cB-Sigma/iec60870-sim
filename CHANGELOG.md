@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.0 (2026-10-11)
+
+Requires iec60870 v0.3.0.
+
+- Both simulators run on iec60870's new `station` package: the point
+  database, station interrogation, the general counter request, clock
+  synchronisation, the test command with time tag and commands
+  (select-before-operate, return information, termination, deactivation)
+  are the library's; the misbehaviour switches reach it through its
+  hooks, and `Procedures` still answers (and records) the other clause
+  7.4 procedures first. The exported API is unchanged; `Station.Library`
+  returns the library station of each simulator, and
+  `iec101sim.Station.Get` was added.
+- Behaviour that follows from the library and differs from v0.2.0: station
+  interrogation sends a CP56Time2a point as its type without time tag
+  and fills each ASDU as far as it goes instead of 20 objects; a
+  regulating step command moves the monitored step position by one
+  instead of setting it to the command's value; an execute after a
+  select must carry the select's value; a clock synchronisation whose
+  time is marked invalid gets a negative confirmation; `iec101sim`
+  answers the general counter request with its integrated totals and an
+  activation termination.
+- The lib60870 interop suite was run again against the simulators on
+  the library station; it passed unchanged.
+
 ## v0.2.0 (2026-10-11)
 
 Requires iec60870 v0.2.0.

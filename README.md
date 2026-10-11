@@ -10,8 +10,12 @@ transfer, speaks TLS and the IEC 62351-5 A-Profile, and has switches
 that make it misbehave the way field devices do. The IEC 101 line holds
 one or more stations behind a TCP "converter", balanced or unbalanced.
 Both run in-process for Go tests or from the command line. They are
-built on the codec and links of
-[iec60870](https://github.com/cB-Sigma/iec60870). Written for SigmaM2M, a
+built on the codec, links and controlled station (`station`) of
+[iec60870](https://github.com/cB-Sigma/iec60870): the library answers
+interrogation, clock synchronisation and commands, and the simulators
+add the switches and the recording around it. For a controlled station
+or gateway in a product, use iec60870's `station` and `gateway`
+packages directly. Written for SigmaM2M, a
 oneM2M platform; it has no dependency on it.
 
 ## What is simulated
@@ -131,7 +135,9 @@ cd interop && SIGMA_IEC60870_INTEROP=1 go test -v ./...
 ### Interop tested against
 
 lib60870-C v2.4.1 (mbedtls 3.6.6), built from source in Docker, on
-2026-10-11. All passed.
+2026-10-11. All passed. For v0.3.0, with the simulators running on
+iec60870's `station` package, the whole suite below was run again and
+passed unchanged.
 
 Added for v0.2.0:
 
