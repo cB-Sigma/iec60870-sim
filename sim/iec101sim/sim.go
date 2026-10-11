@@ -286,7 +286,7 @@ func (l *Line) serve(c net.Conn) {
 			continue
 		}
 		l.mu.Lock()
-		if f.Addr == uint16(1)<<(8*l.ASize)-1 && f.Fn() == cs101.FnUserDataNoReply && f.ASDU != nil {
+		if l.ASize > 0 && f.Addr == uint16(1)<<(8*l.ASize)-1 && f.Fn() == cs101.FnUserDataNoReply && f.ASDU != nil {
 			// A broadcast (6.2.1.1): every station takes it, none answers.
 			for _, st := range l.stations {
 				l.userData(st, f.ASDU)
@@ -295,6 +295,13 @@ func (l *Line) serve(c net.Conn) {
 			continue
 		}
 		s := l.stations[f.Addr]
+		if l.ASize == 0 {
+			// No address field (balanced): the frame is for the line's
+			// station.
+			for _, x := range l.stations {
+				s = x
+			}
+		}
 		silent := s == nil || s.Silent
 		l.mu.Unlock()
 		if silent {

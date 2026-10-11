@@ -131,7 +131,36 @@ cd interop && SIGMA_IEC60870_INTEROP=1 go test -v ./...
 ### Interop tested against
 
 lib60870-C v2.4.1 (mbedtls 3.6.6), built from source in Docker, on
-2026-10-11:
+2026-10-11. All passed.
+
+Added for v0.2.0:
+
+- Every command type with and without CP56Time2a (C_SC, C_DC, C_RC,
+  C_SE normalised, scaled and float, C_BO; 45 to 51 and 58 to 64) from
+  lib60870 to `iec104sim`, confirmed and terminated, the decoded value
+  checked in `Commands`; a time-tagged command older than `MaxDelay`
+  recorded as late and not answered.
+- System commands from lib60870 to `iec104sim`: group interrogation
+  (`Proc.Groups`), counter interrogation, read of a known and an unknown
+  object, reset process with end of initialisation, C_TS_TA_1 (counter
+  and time mirrored), delay acquisition (confirmation and the delay
+  loaded), parameter loading and activation (known and unknown object),
+  and clock synchronisation with SU set, a wrong day of week, 59 999 ms
+  and years 00 and 12.
+- TLS refusals: `iec104sim` requiring client certificates refuses
+  lib60870's certificate from an untrusted CA; lib60870 refuses a station
+  certificate from an untrusted CA.
+- Two lib60870 controlling stations on one `iec104sim`: starting the
+  second closes the first, and the second receives the data.
+- A lib60870 controlling station, unbalanced and balanced, link address
+  0, 1 and 2 octets, cause 1 and 2, common address 1 and 2, object
+  address 1, 2 and 3, against `iec101sim`: interrogation,
+  select-before-operate with termination, clock synchronisation, and
+  M_ME_TF_1 with its time tag read by lib60870. This found that
+  `iec101sim` ignored every frame on a balanced line without a link
+  address field; fixed.
+
+From v0.1.0:
 
 - A lib60870 controlling station (our peer program) against
   `iec104sim`: STARTDT, station interrogation (activation confirmation,
@@ -149,9 +178,10 @@ lib60870-C v2.4.1 (mbedtls 3.6.6), built from source in Docker, on
   `iec101sim`: link start-up and polling, station interrogation, clock
   synchronisation, C_SC_NA_1 select-before-operate with termination, a
   spontaneous value. Passed.
-- Not tested against a reference: the A-Profile (lib60870's secure
-  authentication is not in its open source release), the IEC 101
-  balanced mode, file transfer, the misbehaviour switches.
+- Not tested against a reference: the A-Profile (no open
+  implementation exists to test against; see iec60870's README), file
+  transfer (lib60870 has no controlling-station file service), the
+  misbehaviour switches other than `MaxDelay`.
 
 ## Related repositories
 

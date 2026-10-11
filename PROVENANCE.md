@@ -12,7 +12,11 @@ commands under `cmd/` were written. The simulators, their commands and
 the iec60870 tests and examples that drive them moved out of the
 iec60870 module into this one on 2026-10-11 (with `git mv`), so the
 library does not depend on its simulators, and the lib60870 interop
-tests (interop/) were added.
+tests (interop/) were added. For v0.2.0 (also 2026-10-11) the interop
+tests were extended and the peer program grew; besides lib60870's
+headers and examples, some of its source files were read to write the
+peer (see iec60870's PROVENANCE.md). The one simulator fix of v0.2.0 came
+from a failing interop run.
 
 ## Sources
 
@@ -34,6 +38,6 @@ explains them.
 |---|---|
 | cs104/link_test.go, cs104/seams_test.go, cs104/example_test.go, cs101/example_test.go | the iec60870 links against these simulators, written from the same standards; the window and timer sequences of IEC 60870-5-104 clause 5 |
 | sim/iec104sim/sim_test.go, sim/iec101sim/sim_test.go, cmd/*/main_test.go | the simulators through the iec60870 links |
-| interop/ | lib60870-C v2.4.1 as controlling station (IEC 104, with and without TLS, and IEC 101 unbalanced) |
+| interop/ | lib60870-C v2.4.1 as controlling station (IEC 104 with and without TLS, TLS refusals, two connections; IEC 101 balanced and unbalanced with every field size); expected values are our own choices checked against what the simulators and lib60870's getters read |
 
 All keys, certificates and addresses are made-up demo values.

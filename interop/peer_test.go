@@ -26,7 +26,7 @@ import (
 )
 
 // image is the reference peers' image, built from ./peer.
-const image = "sigma-iec60870-interop:lib60870-2.4.1"
+const image = "sigma-iec60870-interop:lib60870-2.4.1-p2"
 
 // needDocker skips the test unless SIGMA_IEC60870_INTEROP=1 is set and
 // Docker answers, and builds the peer image when it is missing.
@@ -154,6 +154,36 @@ func (p *peer) expect(within time.Duration, parts ...string) string {
 	}
 }
 
+// expectAny waits for a line containing one of alts.
+func (p *peer) expectAny(within time.Duration, alts ...string) string {
+	p.t.Helper()
+	deadline := time.After(within)
+	for {
+		select {
+		case l := <-p.lines:
+			for _, a := range alts {
+				if strings.Contains(l, a) {
+					return l
+				}
+			}
+		case <-deadline:
+			p.t.Fatalf("no peer line with one of %q within %s", alts, within)
+			return ""
+		}
+	}
+}
+
+// kv splits a peer line into its key=value fields.
+func kv(line string) map[string]string {
+	m := map[string]string{}
+	for _, f := range strings.Fields(line) {
+		if k, v, ok := strings.Cut(f, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
 // drain discards the lines received so far.
 func (p *peer) drain() {
 	for {
@@ -171,6 +201,11 @@ type pki struct {
 	dir  string
 	pool *x509.CertPool
 	ours tls.Certificate
+	// rogue is our certificate from an untrusted CA, roguePool trusts only
+	// that CA, rogueDir holds peer files with a rogue peer certificate.
+	rogue     tls.Certificate
+	roguePool *x509.CertPool
+	rogueDir  string
 }
 
 func newPKI(t *testing.T) pki {
@@ -211,5 +246,46 @@ func newPKI(t *testing.T) pki {
 	ourDER, ourKey := leaf(3, "sigma")
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
-	return pki{dir: dir, pool: pool, ours: tls.Certificate{Certificate: [][]byte{ourDER}, PrivateKey: ourKey}}
+	k := pki{dir: dir, pool: pool, ours: tls.Certificate{Certificate: [][]byte{ourDER}, PrivateKey: ourKey}}
+
+	// A second CA nobody trusts: a certificate of ours it signed, a pool
+	// with only it, and rogueDir with the peer's files where the peer's
+	// own certificate is the rogue one (its CA file stays the good one).
+	rk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	rTmpl := &x509.Certificate{SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "rogue CA"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), IsCA: true, BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature}
+	rDER, err := x509.CreateCertificate(rand.Reader, rTmpl, rTmpl, &rk.PublicKey, rk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rca, _ := x509.ParseCertificate(rDER)
+	signed := func(serial int64, name string) ([]byte, *ecdsa.PrivateKey) {
+		key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: name},
+			NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+			DNSNames:    []string{name, "localhost", "host.docker.internal"}, IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)}}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, rca, &key.PublicKey, rk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return der, key
+	}
+	roDER, roKey := signed(11, "sigma")
+	k.rogue = tls.Certificate{Certificate: [][]byte{roDER}, PrivateKey: roKey}
+	k.roguePool = x509.NewCertPool()
+	k.roguePool.AddCert(rca)
+	k.rogueDir = t.TempDir()
+	rpDER, rpKey := signed(12, "peer")
+	write2 := func(name, typ string, b []byte) {
+		if err := os.WriteFile(filepath.Join(k.rogueDir, name), pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: b}), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write2("ca.pem", "CERTIFICATE", caDER)
+	write2("peer.pem", "CERTIFICATE", rpDER)
+	rkb, _ := x509.MarshalECPrivateKey(rpKey)
+	write2("peer.key", "EC PRIVATE KEY", rkb)
+	return k
 }

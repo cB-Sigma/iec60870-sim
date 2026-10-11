@@ -112,6 +112,38 @@ func TestSimUnbalanced(t *testing.T) {
 	}
 }
 
+// A balanced line without a link address field: the frames carry no
+// address, so they are for the line's one station (found against
+// lib60870 2.4.1 as station A).
+func TestSimBalancedNoAddress(t *testing.T) {
+	st := iec101sim.NewStation(3, 7)
+	st.Set(300, iec101sim.Point{Type: iec60870.MMeNc1, Value: 11.5})
+	ln := iec101sim.NewLine(true, st)
+	ln.ASize = 0
+	if err := ln.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ln.Stop)
+	c, err := net.Dial("tcp", ln.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cs101.NewLink(cs101.NewPort(c), 0, true, 500*time.Millisecond, 2)
+	t.Cleanup(l.Close)
+	if err := l.Start(context.Background(), 3); err != nil {
+		t.Fatalf("link start without an address field: %v", err)
+	}
+	if err := ln.Spontaneous(st, &iec60870.ASDU{Type: iec60870.MMeNc1, Cause: iec60870.CauseSpontaneous,
+		Objects: []iec60870.Object{{IOA: 300, Value: 12.25}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-l.ASDUs():
+	case <-time.After(3 * time.Second):
+		t.Fatal("no spontaneous data on the line without addresses")
+	}
+}
+
 // Balanced: the station sends its data itself as confirmed user data.
 func TestSimBalanced(t *testing.T) {
 	ln, st, l := line(t, true)

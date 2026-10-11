@@ -7,7 +7,7 @@
 # peer.c of this directory linked against them. socat bridges a pty to TCP
 # for IEC 101. The image is a test peer only; nothing of it is distributed.
 #
-#   docker build -t sigma-iec60870-interop:lib60870-2.4.1 .
+#   docker build -t sigma-iec60870-interop:lib60870-2.4.1-p2 .
 
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
